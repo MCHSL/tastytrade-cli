@@ -1,3 +1,5 @@
+#![feature(async_closure)]
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
@@ -6,7 +8,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures_util::StreamExt;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, ops::DerefMut};
 use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Layout},
@@ -15,9 +17,16 @@ use tui::{
     Frame, Terminal,
 };
 
-use rust_decimal::{prelude::FromPrimitive, Decimal};
+use rust_decimal::{
+    prelude::{FromPrimitive, Zero},
+    Decimal,
+};
 use tastytrade_rs::{
-    api::{order::Symbol, position::QuantityDirection, quote_streaming::DxFeedSymbol},
+    api::{
+        order::Symbol,
+        position::{self, QuantityDirection},
+        quote_streaming::DxFeedSymbol,
+    },
     dxfeed::{self, Event, EventData},
     TastyTrade,
 };
@@ -51,25 +60,54 @@ struct PriceRecord {
     greeks: SimpleGreeks,
 }
 
+#[derive(Default)]
+struct UnderlyingGroup {
+    open: bool,
+    pub records: BTreeMap<DxFeedSymbol, PriceRecord>,
+}
+
 struct App {
     state: TableState,
-    records: BTreeMap<Symbol, BTreeMap<DxFeedSymbol, PriceRecord>>,
+    groups: BTreeMap<Symbol, UnderlyingGroup>,
     num_lines: usize,
 }
 
 impl App {
-    fn new(records: BTreeMap<Symbol, BTreeMap<DxFeedSymbol, PriceRecord>>) -> Self {
-        let num_lines = records
-            .iter()
-            .map(|e| e.1.len())
-            .fold(records.len(), |acc, v| acc + v);
-
-        Self {
+    fn new(records: BTreeMap<Symbol, UnderlyingGroup>) -> Self {
+        let mut this = Self {
             state: TableState::default(),
-            records,
-            num_lines,
+            groups: records,
+            num_lines: 0,
+        };
+
+        this.update_num_lines();
+        this
+    }
+
+    pub fn update_num_lines(&mut self) {
+        self.num_lines = self.groups.values().fold(self.groups.len(), |acc, group| {
+            acc + if group.open { group.records.len() } else { 0 }
+        });
+    }
+
+    pub fn toggle_group(&mut self) {
+        let selected = match self.state.selected() {
+            Some(s) => s,
+            None => return,
+        };
+        let mut i = 0;
+        for group in self.groups.values_mut() {
+            if i == selected {
+                group.open = !group.open;
+                break;
+            }
+            i += 1;
+            if group.open {
+                i += group.records.len()
+            }
         }
     }
+
     pub fn next(&mut self) {
         let i = match self.state.selected() {
             Some(i) => {
@@ -99,8 +137,8 @@ impl App {
     }
 
     pub fn get_record(&mut self, symbol: DxFeedSymbol) -> Option<&mut PriceRecord> {
-        for (_, positions) in self.records.iter_mut() {
-            for (pos_symbol, pos) in positions.iter_mut() {
+        for positions in self.groups.values_mut() {
+            for (pos_symbol, pos) in positions.records.iter_mut() {
                 if *pos_symbol == symbol {
                     return Some(pos);
                 }
@@ -127,14 +165,16 @@ async fn main() -> Result<()> {
         positions.extend(account.positions().await.unwrap());
     }
 
-    let mut stream_syms = Vec::with_capacity(positions.len());
-    let mut records: BTreeMap<Symbol, BTreeMap<DxFeedSymbol, PriceRecord>> = BTreeMap::new();
-    for pos in positions.iter() {
-        let stream_sym = tasty
-            .get_streamer_symbol(&pos.instrument_type, &pos.symbol)
-            .await?;
-        stream_syms.push(stream_sym.clone());
+    let sym_futures = positions
+        .iter()
+        .map(|pos| tasty.get_streamer_symbol(&pos.instrument_type, &pos.symbol));
 
+    let stream_syms = futures::future::join_all(sym_futures).await;
+    let stream_syms: Result<Vec<_>, _> = stream_syms.into_iter().collect();
+    let stream_syms = stream_syms?;
+
+    let mut records: BTreeMap<Symbol, UnderlyingGroup> = BTreeMap::new();
+    for (pos, stream_sym) in positions.iter().zip(stream_syms.iter()) {
         let record = PriceRecord {
             symbol: pos.symbol.clone(),
             open: pos.average_open_price.round_dp(2),
@@ -150,7 +190,8 @@ async fn main() -> Result<()> {
         records
             .entry(pos.underlying_symbol.clone())
             .or_default()
-            .insert(stream_sym, record);
+            .records
+            .insert(stream_sym.clone(), record);
     }
 
     let mut quote_streamer = tasty.create_quote_streamer().await?;
@@ -173,7 +214,7 @@ async fn main() -> Result<()> {
                     if let Some(record) = app.get_record(DxFeedSymbol(sym)) {
                         match data {
                             EventData::Quote(quote) => {
-                                record.current = Decimal::from_f64((quote.bid_price + quote.ask_price) / 2.0).unwrap();
+                                record.current = Decimal::from_f64((quote.bid_price + quote.ask_price) / 2.0).unwrap_or_default();
                             }
                             EventData::Greeks(greeks) => {
                                 record.greeks = SimpleGreeks {
@@ -195,6 +236,7 @@ async fn main() -> Result<()> {
                                     KeyCode::Char('q') => break,
                                     KeyCode::Down => app.next(),
                                     KeyCode::Up => app.previous(),
+                                    KeyCode::Char(' ') => app.toggle_group(),
                                     _ => {}
                                 }
                             }
@@ -238,9 +280,15 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     .map(|h| Cell::from(*h).style(Style::default().fg(Color::Red)));
     let header = Row::new(header_cells).style(normal_style).height(1);
 
-    let rows = app.records.iter().flat_map(|(underlying_symbol, records)| {
-        let mut rows = vec![Row::new(vec![underlying_symbol.0.clone()]).height(1)];
-        for rec in records.values() {
+    let rows = app.groups.iter().flat_map(|(underlying_symbol, records)| {
+        let mut rows = vec![vec![
+            underlying_symbol.0.clone(),
+            "".to_owned(),
+            "".to_owned(),
+            "".to_owned(),
+        ]];
+        let mut profit_sum = Decimal::zero();
+        for rec in records.records.values() {
             let to_net = |value: Decimal| -> Decimal {
                 (value
                     * rec.amount
@@ -253,6 +301,11 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
                 .round_dp(2)
             };
             let profit = to_net(rec.current - rec.open);
+            profit_sum += profit;
+
+            if !records.open {
+                continue;
+            }
             let theta = to_net(Decimal::from_f64(rec.greeks.theta).unwrap());
             let delta = to_net(Decimal::from_f64(rec.greeks.delta).unwrap());
 
@@ -264,15 +317,27 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             let cells = vec![
                 format!(" {}", name),
                 rec.current.round_dp(2).to_string(),
-                rec.amount.round_dp(5).to_string(),
+                (rec.amount
+                    * if let QuantityDirection::Short = rec.direction {
+                        Decimal::from(-1)
+                    } else {
+                        Decimal::from(1)
+                    })
+                .round_dp(5)
+                .to_string(),
                 rec.open.to_string(),
                 profit.to_string(),
                 theta.to_string(),
                 delta.to_string(),
             ];
-            rows.push(Row::new(cells).height(1))
+            rows.push(cells)
         }
-        rows
+
+        rows.get_mut(0)
+            .unwrap()
+            .push(profit_sum.round_dp(2).to_string());
+
+        rows.into_iter().map(Row::new)
     });
 
     let t = Table::new(rows)
