@@ -8,7 +8,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures_util::StreamExt;
-use std::{collections::BTreeMap, ops::DerefMut};
+use std::collections::BTreeMap;
 use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Layout},
@@ -23,8 +23,9 @@ use rust_decimal::{
 };
 use tastytrade_rs::{
     api::{
+        account_streaming::{AccountEvent, AccountMessage},
         order::Symbol,
-        position::{self, QuantityDirection},
+        position::QuantityDirection,
         quote_streaming::DxFeedSymbol,
     },
     dxfeed::{self, Event, EventData},
@@ -70,14 +71,19 @@ struct App {
     state: TableState,
     groups: BTreeMap<Symbol, UnderlyingGroup>,
     num_lines: usize,
+    balances: BTreeMap<String, Decimal>,
 }
 
 impl App {
-    fn new(records: BTreeMap<Symbol, UnderlyingGroup>) -> Self {
+    fn new(
+        records: BTreeMap<Symbol, UnderlyingGroup>,
+        balances: BTreeMap<String, Decimal>,
+    ) -> Self {
         let mut this = Self {
             state: TableState::default(),
             groups: records,
             num_lines: 0,
+            balances,
         };
 
         this.update_num_lines();
@@ -106,6 +112,7 @@ impl App {
                 i += group.records.len()
             }
         }
+        self.update_num_lines();
     }
 
     pub fn next(&mut self) {
@@ -160,11 +167,16 @@ async fn main() -> Result<()> {
 
     println!("Downloading account info...");
 
+    let account_streamer = tasty.create_account_streamer().await?;
     let mut positions = Vec::new();
+    let mut balances = BTreeMap::new();
     for account in tasty.accounts().await.unwrap() {
+        account_streamer.subscribe_to_account(&account).await;
         positions.extend(account.positions().await.unwrap());
+        balances.insert(account.number().0, account.balance().await?.cash_balance);
     }
 
+    println!("Downloading symbols...");
     let sym_futures = positions
         .iter()
         .map(|pos| tasty.get_streamer_symbol(&pos.instrument_type, &pos.symbol));
@@ -173,6 +185,7 @@ async fn main() -> Result<()> {
     let stream_syms: Result<Vec<_>, _> = stream_syms.into_iter().collect();
     let stream_syms = stream_syms?;
 
+    println!("Setting up records...");
     let mut records: BTreeMap<Symbol, UnderlyingGroup> = BTreeMap::new();
     for (pos, stream_sym) in positions.iter().zip(stream_syms.iter()) {
         let record = PriceRecord {
@@ -194,6 +207,7 @@ async fn main() -> Result<()> {
             .insert(stream_sym.clone(), record);
     }
 
+    print!("Setting up quote streaming...");
     let mut quote_streamer = tasty.create_quote_streamer().await?;
     let quote_sub = quote_streamer.create_sub(dxfeed::DXF_ET_QUOTE | dxfeed::DXF_ET_GREEKS);
     quote_sub.add_symbols(&stream_syms);
@@ -204,7 +218,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(records);
+    let mut app = App::new(records, balances);
     let mut keyboard_event_stream = EventStream::new();
 
     loop {
@@ -224,6 +238,13 @@ async fn main() -> Result<()> {
                             }
                             _ => {}
                         }
+                    }
+                }
+            }
+            ev = account_streamer.get_event() => {
+                if let Ok(AccountEvent::AccountMessage(msg)) = ev {
+                    if let AccountMessage::AccountBalance(bal) = *msg {
+                        app.balances.insert(bal.account_number.0, bal.cash_balance);
                     }
                 }
             }
@@ -268,6 +289,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     let selected_style = Style::default().add_modifier(Modifier::REVERSED);
     let normal_style = Style::default().bg(Color::Blue);
     let header_cells = [
+        "PORT %",
         "SYMBOL",
         "CURRENT",
         "AMOUNT",
@@ -275,70 +297,117 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         "PROFIT",
         "THETA",
         "DELTA",
+        "NET LIQ",
     ]
     .iter()
     .map(|h| Cell::from(*h).style(Style::default().fg(Color::Red)));
     let header = Row::new(header_cells).style(normal_style).height(1);
 
-    let rows = app.groups.iter().flat_map(|(underlying_symbol, records)| {
-        let mut rows = vec![vec![
-            underlying_symbol.0.clone(),
-            "".to_owned(),
-            "".to_owned(),
-            "".to_owned(),
-        ]];
-        let mut profit_sum = Decimal::zero();
-        for rec in records.records.values() {
-            let to_net = |value: Decimal| -> Decimal {
-                (value
-                    * rec.amount
-                    * rec.multiplier
-                    * if let QuantityDirection::Short = rec.direction {
-                        Decimal::from(-1)
-                    } else {
-                        Decimal::from(1)
-                    })
-                .round_dp(2)
-            };
-            let profit = to_net(rec.current - rec.open);
-            profit_sum += profit;
-
-            if !records.open {
-                continue;
-            }
-            let theta = to_net(Decimal::from_f64(rec.greeks.theta).unwrap());
-            let delta = to_net(Decimal::from_f64(rec.greeks.delta).unwrap());
-
-            let name = if rec.symbol == *underlying_symbol {
-                "SHARES".to_owned()
-            } else {
-                rec.symbol.0.clone()
-            };
-            let cells = vec![
-                format!(" {}", name),
-                rec.current.round_dp(2).to_string(),
-                (rec.amount
-                    * if let QuantityDirection::Short = rec.direction {
-                        Decimal::from(-1)
-                    } else {
-                        Decimal::from(1)
-                    })
-                .round_dp(5)
-                .to_string(),
-                rec.open.to_string(),
-                profit.to_string(),
-                theta.to_string(),
-                delta.to_string(),
-            ];
-            rows.push(cells)
-        }
-
-        rows.get_mut(0)
-            .unwrap()
-            .push(profit_sum.round_dp(2).to_string());
-
-        rows.into_iter().map(Row::new)
+    let mut total = app.groups.iter().fold(Decimal::zero(), |acc, (_, group)| {
+        acc + group.records.iter().fold(Decimal::zero(), |acc, (_, rec)| {
+            acc + (rec.current
+                * rec.amount
+                * rec.multiplier
+                * if let QuantityDirection::Short = rec.direction {
+                    Decimal::from(-1)
+                } else {
+                    Decimal::from(1)
+                })
+            .round_dp(2)
+        })
     });
+
+    let mut rows: Vec<Row> = app
+        .groups
+        .iter()
+        .flat_map(|(underlying_symbol, records)| {
+            let mut rows = vec![vec![]];
+            let mut profit_sum = Decimal::zero();
+            let mut net_liq_sum = Decimal::zero();
+            for rec in records.records.values() {
+                let to_net = |value: Decimal| -> Decimal {
+                    (value
+                        * rec.amount
+                        * rec.multiplier
+                        * if let QuantityDirection::Short = rec.direction {
+                            Decimal::from(-1)
+                        } else {
+                            Decimal::from(1)
+                        })
+                    .round_dp(2)
+                };
+                let profit = to_net(rec.current - rec.open);
+                profit_sum += profit;
+
+                let net_liq = to_net(rec.current);
+                net_liq_sum += net_liq;
+
+                if !records.open {
+                    continue;
+                }
+                let theta = to_net(Decimal::from_f64(rec.greeks.theta).unwrap());
+                let delta = to_net(Decimal::from_f64(rec.greeks.delta).unwrap());
+
+                let name = if rec.symbol == *underlying_symbol {
+                    "SHARES".to_owned()
+                } else {
+                    rec.symbol.0.clone()
+                };
+                let cells = vec![
+                    ((net_liq * Decimal::from_u64(100).unwrap()) / total)
+                        .round_dp(2)
+                        .to_string()
+                        + "%",
+                    format!(" {}", name),
+                    rec.current.round_dp(2).to_string(),
+                    (rec.amount
+                        * if let QuantityDirection::Short = rec.direction {
+                            Decimal::from(-1)
+                        } else {
+                            Decimal::from(1)
+                        })
+                    .round_dp(5)
+                    .to_string(),
+                    rec.open.to_string(),
+                    profit.to_string(),
+                    theta.to_string(),
+                    delta.to_string(),
+                    net_liq.to_string(),
+                ];
+                rows.push(cells)
+            }
+
+            let group_header = rows.get_mut(0).unwrap();
+            group_header.extend(vec![
+                ((net_liq_sum * Decimal::from_u64(100).unwrap()) / total)
+                    .round_dp(2)
+                    .to_string()
+                    + "%",
+                underlying_symbol.0.clone(),
+                "".to_owned(),
+                "".to_owned(),
+                "".to_owned(),
+                profit_sum.round_dp(2).to_string(),
+                "".to_owned(),
+                "".to_owned(),
+                net_liq_sum.round_dp(2).to_string(),
+            ]);
+
+            rows.into_iter().map(Row::new)
+        })
+        .collect();
+
+    rows.push(Row::new(vec![""]));
+    rows.push(Row::new(vec!["CASH"]));
+    for (account, balance) in &app.balances {
+        rows.push(Row::new(vec![
+            " ".to_owned() + account,
+            balance.to_string(),
+        ]));
+        total += balance;
+    }
+    rows.push(Row::new(vec![""]));
+    rows.push(Row::new(vec!["TOTAL".to_owned(), total.to_string()]));
 
     let t = Table::new(rows)
         .header(header)
@@ -346,7 +415,9 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         .highlight_style(selected_style)
         .highlight_symbol(">> ")
         .widths(&[
+            Constraint::Length(8),
             Constraint::Length(25),
+            Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(12),
